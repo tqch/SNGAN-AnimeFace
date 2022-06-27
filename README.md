@@ -27,15 +27,15 @@
 
 ### Truncation effect
 
-*from top to bottom: the variance varies from 0.3 to 2 linearly*
+*from top to bottom: the variance varies from 0.3 to 3 cubically*
 
-![truncation-effect](./assets/truncation-effect.jpg)
+![truncation-effect](./assets/truncation-effect.gif)
 
 
 
 ### Interpolation
 
-![interpolation](./assets/interpolation.jpg)
+![interpolation](./assets/interpolation.gif)
 
 ## References
 
