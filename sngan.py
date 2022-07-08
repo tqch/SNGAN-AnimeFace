@@ -1,8 +1,6 @@
-from snresnet import get_block
-from snconv import SNConv2d
-from snlinear import SNLinear
 import torch
 import torch.nn as nn
+from spectral_norm import *
 
 normalize_G = nn.BatchNorm2d
 activation_D = nn.ReLU(inplace=True)
