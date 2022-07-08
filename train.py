@@ -12,6 +12,8 @@ if __name__ == "__main__":
     from dataset import AnimeFace
     from sngan import NetD, NetG
     import torch.cuda.amp as amp
+    from utils import BatchSizeTuner, EMA
+    from contextlib import nullcontext
 
     from argparse import ArgumentParser
 
@@ -19,7 +21,7 @@ if __name__ == "__main__":
     parser.add_argument("--root", type=str, default="~/datasets")
     parser.add_argument("--gpu", type=str, default="0")
     parser.add_argument("--download", action="store_true")
-    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--base-ch", type=int, default=64)
     parser.add_argument("--latent-dim", type=int, default=128)
     parser.add_argument("--num-blocks", type=str, default="1,1,1,1")
@@ -40,6 +42,9 @@ if __name__ == "__main__":
     parser.add_argument("--chkpt-intv", type=int, default=10)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--use-amp", action="store_true")
+    parser.add_argument("--auto-bsz", action="store_true")
+    parser.add_argument("--use-ema", action="store_true")
+    parser.add_argument("--ema-decay", type=float, default=0.9999)
     args = parser.parse_args()
 
     # train generative models on whole dataset
@@ -50,6 +55,13 @@ if __name__ == "__main__":
         transforms.Normalize((0.5,) * 3, (0.5,) * 3)  # rescale to [-1, 1]
     ])
 
+    # turn on cudnn benchmarking for performance boost when available
+    # it will select the fastest convolution algorithm
+    cudnnbm = False
+    if torch.backends.cudnn.is_available():
+        torch.backends.cudnn.benchmark = cudnnbm = True
+        print(f"cuDNN benchmark: ON")
+
     # build dataloader
     root = os.path.expanduser(args.root)
     download = args.download
@@ -58,7 +70,7 @@ if __name__ == "__main__":
 
     # if seeing an error, change num_workers to 0
     trainloader = DataLoader(
-        traindata, shuffle=True, batch_size=batch_size, pin_memory=True, num_workers=os.cpu_count())
+        traindata, shuffle=True, batch_size=batch_size, drop_last=cudnnbm, pin_memory=True, num_workers=os.cpu_count())
 
     # training hyparameters
     lr = args.lr
@@ -87,12 +99,22 @@ if __name__ == "__main__":
     netD.to(device)
     netG.to(device)
 
+    # build exponential moving average manager
+    use_ema = args.use_ema
+    if use_ema:
+        ema_decay = args.ema_decay
+        print(f"Creating EMA manager (decay = {ema_decay})...", end="")
+        ema = EMA(netG, decay=ema_decay)
+        print("success!")
+    else:
+        ema = nullcontext()
+
     # build optimizers
     # apply Two Time-scale Update Rule (TTUR) [2]
     # [2] Heusel, Martin, et al. "Gans trained by a two time-scale update rule converge to a local nash equilibrium."
     # Advances in neural information processing systems 30 (2017).
     ttur = args.ttur
-    optD = Adam(netD.parameters(), lr=ttur*lr, betas=(beta1, beta2))
+    optD = Adam(netD.parameters(), lr=ttur * lr, betas=(beta1, beta2))
     optG = Adam(netG.parameters(), lr=lr, betas=(beta1, beta2))
 
     loss_type = args.loss
@@ -105,7 +127,8 @@ if __name__ == "__main__":
         # [1] Lim, Jae Hyun, and Jong Chul Ye. "Geometric gan." arXiv preprint arXiv:1705.02894 (2017).
         loss_fn_D = lambda x, y: torch.clamp(
             1 - torch.where(y == 1, x, -x), min=0).mean()
-        loss_fn_G = lambda x, _: x.neg().mean()
+        loss_fn_G = lambda x, _: x.mean().neg()
+        netD.out_fc[-1].bias = None  # disable discriminator output bias for hinge loss
     else:
         raise NotImplementedError(loss_type)
     print(f"Loss type: {loss_type}")
@@ -140,7 +163,7 @@ if __name__ == "__main__":
     chkpt_path = os.path.join(chkpt_dir, "anime-sngan.pt")
     if not os.path.exists(chkpt_dir):
         os.makedirs(chkpt_dir)
-    print(f"Checkpoint will be saved to {os.path.abspath(chkpt_path)}", end="")
+    print(f"Checkpoint will be saved to {os.path.abspath(chkpt_path)}", end=" ")
     print(f"every {chkpt_intv} epochs")
 
     img_dir = args.img_dir
@@ -165,18 +188,94 @@ if __name__ == "__main__":
         try:
             scalerD.load_state_dict(chkpt["scalerD"])
             scalerG.load_state_dict(chkpt["scalerG"])
+            ema.__dict__.update(chkpt["ema"])
         except KeyError:
             pass
-
         start_epoch = chkpt["epoch"]
         del chkpt
         print("success!")
 
-    # turn on cudnn benchmarking for performance boost
-    # it will select the fastest convolution algorithm
-    if torch.backends.cudnn.is_available():
-        torch.backends.cudnn.benchmark = True
-        print(f"cuDNN benchmark: ON")
+
+    def train_step(i, x_true, use_amp):
+        # ==================
+        # Discriminator step
+        # ==================
+        cnt = x_true.shape[0]
+
+        # inner loop
+        temp_dis_loss = 0
+        j = 0
+        while j < dis_iters:
+            netD.zero_grad(set_to_none=True)
+            with amp.autocast(enabled=use_amp):
+                dis_loss = loss_fn_D(
+                    netD(x_true.to(device)), torch.ones((cnt, 1), device=device))
+                with torch.no_grad():
+                    x_fake = netG.sample(cnt)
+                dis_loss += loss_fn_D(
+                    netD(x_fake), torch.zeros((cnt, 1), device=device))
+            scalerD.scale(dis_loss).backward()
+            scalerD.step(optD)
+            scalerD.update()
+            netD.zero_grad(set_to_none=True)
+            temp_dis_loss += dis_loss.item()
+            j += 1
+            if dis_loss.item() < dis_minloss:
+                break
+        temp_dis_loss /= j
+
+        # ==============
+        # Generator step
+        # ==============
+        if i % dis_freq == 0:
+            temp_gen_loss = 0
+            for _ in range(gen_batches):
+                with amp.autocast(enabled=use_amp):
+                    x_fake = netG.sample(cnt)
+                    gen_loss = loss_fn_G(
+                        netD(x_fake), torch.ones((cnt * gen_batches, 1), device=device)
+                    ) / gen_batches
+                    scalerG.scale(gen_loss).backward()
+                    temp_gen_loss += gen_loss.item()
+            scalerG.step(optG)
+            scalerG.update()
+            if use_ema:
+                ema.update()
+            netG.zero_grad(set_to_none=True)
+            return temp_dis_loss, temp_gen_loss, cnt
+        else:
+            return temp_dis_loss, 0, cnt
+
+    # automatically select maximum batch size
+    auto_bsz = args.auto_bsz
+    if auto_bsz:
+        print("Automatically selecting the optimal batch size...", flush=True)
+        # temporarily disable cudnn benchmark is disabled for tuning purpose
+        torch.backends.cudnn.benchmark = False
+        # override both dis_iter and dis_freq for tuning purpose
+        dis_iters_, dis_freq_ = dis_iters, dis_freq
+        dis_iters = dis_freq = 1
+        bsztuner = BatchSizeTuner(trainloader, device=device, start_bsz=batch_size)
+        for x in bsztuner:
+            passed = True
+            try:
+                train_step(0, x, False)  # disable amp by default
+            except RuntimeError as e:
+                passed = False
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
+            finally:
+                bsztuner.update(passed)
+        batch_size = bsztuner.max_bsz or batch_size
+        if batch_size != trainloader.batch_size:
+            # create a new trainloader with updated batch size
+            trainloader = DataLoader(
+                traindata, shuffle=True, batch_size=batch_size, drop_last=True, pin_memory=True,
+                num_workers=os.cpu_count())
+        # back to normal setting
+        dis_iters, dis_freq = dis_iters_, dis_freq_
+        torch.backends.cudnn.benchmark = cudnnbm
+        del bsztuner
 
     print("Training starts...", flush=True)
     for e in range(start_epoch, total_epochs):
@@ -187,61 +286,34 @@ if __name__ == "__main__":
         with tqdm(trainloader, desc=f"{e + 1}/{total_epochs} epochs") as t:
             netG.train()
             for i, x_true in enumerate(t):
-                # ==================
-                # Discriminator step
-                # ==================
-                cnt = x_true.shape[0]
+                # perform single train step
+                dis_loss, gen_loss, cnt = train_step(i, x_true, use_amp)
 
-                # inner loop
-                temp_dis_loss = 0
-                for j in range(dis_iters):
-                    netD.zero_grad(set_to_none=True)
-                    with amp.autocast(enabled=use_amp):
-                        dis_loss = loss_fn_D(
-                            netD(x_true.to(device)), torch.ones((cnt, 1), device=device))
-                        with torch.no_grad():
-                            x_fake = netG.sample(cnt)
-                        dis_loss += loss_fn_D(
-                            netD(x_fake), torch.zeros((cnt, 1), device=device))
-                    scalerD.scale(dis_loss).backward()
-                    scalerD.step(optD)
-                    scalerD.update()
-                    temp_dis_loss += dis_loss.item()
-                    if dis_loss.item() < dis_minloss:
-                        temp_dis_loss /= j + 1
-                        break
-                # keep track of running statistics
-                total_dis_loss += temp_dis_loss * cnt
+                # update running statistics
+                total_dis_loss += dis_loss * cnt
                 total_dis_cnt += cnt
+                total_gen_loss += gen_loss * cnt * gen_batches
+                total_gen_cnt += cnt * gen_batches
 
-                # ==============
-                # Generator step
-                # ==============
-                if i % dis_freq == 0:
-                    netG.zero_grad(set_to_none=True)
-                    for _ in range(gen_batches):
-                        with amp.autocast(enabled=use_amp):
-                            x_fake = netG.sample(batch_size)
-                            gen_loss = loss_fn_G(
-                                netD(x_fake), torch.ones((gen_samps, 1), device=device))
-                            scalerG.scale(gen_loss).backward()
-                    scalerG.step(optG)
-                    scalerG.update()
-                    total_gen_loss += gen_loss.item() * gen_samps
-                    total_gen_cnt += gen_samps
-
+                # set progress bar postfix information
                 t.set_postfix({
                     "dis_loss": total_dis_loss / total_dis_cnt,
                     "gen_loss": total_gen_loss / total_gen_cnt
                 })
 
+                # generate images from a fixed noise at the end of every epoch
                 if i == len(trainloader) - 1:
                     netG.eval()
                     with torch.no_grad():
-                        gen_imgs = netG.sample(nimgs, fixed_noise).cpu()
+                        with ema:
+                            gen_imgs = netG.sample(nimgs, fixed_noise).cpu()
                     gen_imgs = make_grid(
-                        gen_imgs, nrow=math.floor(math.sqrt(nimgs)), normalize=True, value_range=(-1, 1)).numpy().transpose(1, 2, 0)
+                        gen_imgs, nrow=math.floor(math.sqrt(nimgs)), normalize=True,
+                        value_range=(-1, 1)).numpy().transpose(1, 2, 0)
                     plt.imsave(os.path.join(img_dir, f"anime-face-{e + 1}.jpg"), gen_imgs)
+
+                    # save checkpoint
+                    _ema = ema.state_dict() if use_ema else dict()
                     if (e + 1) % chkpt_intv == 0:
                         torch.save(
                             {
@@ -251,5 +323,6 @@ if __name__ == "__main__":
                                 "optG": optG.state_dict(),
                                 "scalerD": scalerD.state_dict(),
                                 "scalerG": scalerG.state_dict(),
+                                "ema": _ema,
                                 "epoch": e + 1
                             }, chkpt_path)
