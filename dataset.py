@@ -5,9 +5,10 @@ import numpy as np
 from utils import kaggle_setup
 from zipfile import ZipFile
 import hashlib
+from torch.utils.data import Dataset
 
 
-class AnimeFace:
+class AnimeFace(Dataset):
     base_folder = "animefacedataset"
     img_folder = "images"
     seed = 1234
