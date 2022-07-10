@@ -1,4 +1,11 @@
+<p align="center">
+<img alt="banner" src="./assets/banner.gif"/>
+</p>
+
+***
+
 # SNGAN on Anime Face Dataset
+
 > This repo provides an unofficial PyTorch Implementation of Spectral Normalization for Generative Adversarial Networks (SNGAN)[^1] with specialization in Anime faces[^2] generation.
 
 ## Roadmap
@@ -26,22 +33,23 @@
 
 *evolving over 50 training epochs*
 
-![fixed-noise](./assets/fixed-noise.gif)
-
-### Walk in the latent space
-
-![latent-walk](./assets/latent-walk.gif)
+<p align="center">
+<img alt="fixed-noise" src="./assets/fixed-noise.gif"/>
+</p>
 
 ### Interpolation
 
-![interpolation](./assets/interpolation.gif)
+<p align="center">
+<img alt="interpolation" src="./assets/interpolation.gif"/>
+</p>
 
 ### Truncation effect
 
 *from top to bottom: the variance varies from 0.3 to 3 cubically*
 
-![truncation-effects](./assets/truncation-effects.gif)
-
+<p align="center">
+<img alt="truncation-effects" src="./assets/truncation-effects.gif"/>
+</p>
 
 ## References
 
